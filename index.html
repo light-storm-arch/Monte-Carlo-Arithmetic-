@@ -596,8 +596,8 @@ const ASSET_CLASSES = [
   'Small Cap Stocks', "Int'l Developed Stocks", "Int'l Emerging Stocks",
   'REITs', 'Commodities'
 ];
-const ASSET_RETURNS = [0.0330, 0.0400, 0.0450, 0.0500, 0.0700, 0.0700, 0.0710, 0.0730, 0.0750, 0.0830, 0.0620, 0.0400]; // geometric (compound) returns - median compound return will equal these values
-const ASSET_STDDEVS = [0.015, 0.04, 0.06, 0.10, 0.18, 0.19, 0.19, 0.21, 0.20, 0.26, 0.23, 0.22]; // log return volatilities (annualized std dev of continuously compounded returns)
+const ASSET_RETURNS = [0.0331, 0.0408, 0.0467, 0.0548, 0.0850, 0.0867, 0.0877, 0.0934, 0.0934, 0.1138, 0.0866, 0.0630]; // arithmetic (simple) mean returns
+const ASSET_STDDEVS = [0.015, 0.04, 0.06, 0.10, 0.18, 0.19, 0.19, 0.21, 0.20, 0.26, 0.23, 0.22]; // arithmetic standard deviations (annualized std dev of simple returns)
 const ASSET_CORR_MATRIX = [
   [1.00, 0.40, 0.10, 0.00,-0.05,-0.05,-0.10,-0.10, 0.00, 0.00,-0.10, 0.10],
   [0.40, 1.00, 0.40, 0.50, 0.00, 0.00, 0.00,-0.10, 0.20, 0.10, 0.10, 0.20],
@@ -706,27 +706,22 @@ const ASSET_CORR_FIXED = ensurePositiveDefinite(ASSET_CORR_MATRIX);
 const CHOLESKY_L = choleskyDecomposition(ASSET_CORR_FIXED);
 if (!CHOLESKY_L) console.error('Failed to compute Cholesky decomposition of asset correlation matrix!');
 
-// Log-normal return generator: ensures median compound return equals geometric mean
-// Takes geometric (compound) mean and log return volatility as inputs
+// Normal distribution return generator: uses arithmetic mean and standard deviation
+// Takes arithmetic (simple) mean and arithmetic volatility as inputs
 // If z is provided, uses it directly; otherwise generates via Box-Muller
-const generateReturn = (geometricMean, logVolatility, z) => {
+// Returns are floored at -99% to prevent impossible scenarios
+const generateReturn = (arithmeticMean, volatility, z) => {
   // Generate standard normal random number (Box-Muller) if not provided
   if (z === undefined) {
     const u1 = Math.random(), u2 = Math.random();
     z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
   }
 
-  // Convert geometric mean to log return mean: μ_log = ln(1 + g)
-  // This ensures the median of (1 + R) equals (1 + g)
-  const logMean = Math.log(1 + geometricMean);
+  // Normal distribution: return = mean + volatility * z
+  const simpleReturn = arithmeticMean + volatility * z;
 
-  // Use volatility directly as log return std dev (standard financial convention)
-  // logVolatility is the annualized std dev of continuously compounded returns
-  const logReturn = logMean + logVolatility * z;
-
-  // Convert to simple return: R = exp(log_return) - 1
-  // Note: exp() ensures return > -100% (can't lose more than everything)
-  return Math.exp(logReturn) - 1;
+  // Floor at -99% to prevent impossible negative portfolio values
+  return Math.max(simpleReturn, -0.99);
 };
 
 // =============================================================================
@@ -1384,7 +1379,7 @@ const generatePDF = (inputs, results) => {
   html += '<h2>Financial Assumptions</h2>';
   html += '<div class="grid-2"><div class="card"><div class="assumptions-row"><span>Base Annual Spending (After-Tax)</span><strong>' + formatCurrency(baseSpending) + '</strong></div>';
   if (survivorSpending != null) html += '<div class="assumptions-row"><span>Survivor Annual Spending (After-Tax)</span><strong>' + formatCurrency(survivorSpending) + '</strong></div>';
-  html += '<div class="assumptions-row"><span>Portfolio Geometric Return</span><strong>' + (expectedReturn * 100).toFixed(2) + '%</strong></div>';
+  html += '<div class="assumptions-row"><span>Portfolio Arithmetic Return</span><strong>' + (expectedReturn * 100).toFixed(2) + '%</strong></div>';
   html += '<div class="assumptions-row"><span>Portfolio Std Deviation</span><strong>' + (stdDev * 100).toFixed(2) + '%</strong></div>';
   html += '<div class="assumptions-row"><span>Base Inflation Rate</span><strong>' + (baseInflation * 100).toFixed(2) + '%</strong></div>';
   html += '<div class="assumptions-row"><span>Target Success Rate</span><strong>' + (targetSuccessRate * 100).toFixed(0) + '%</strong></div>';
@@ -2119,7 +2114,7 @@ function App() {
               {!allocationsValid && <span className="text-xs text-red-400">{allocationSum > 100 ? 'Exceeds 100%' : `${100 - allocationSum}% remaining`}</span>}
             </div>
             <div className="bg-slate-800/50 rounded-lg px-4 py-2 text-xs text-slate-500 space-y-1">
-              <div className="flex justify-between gap-6"><span>Portfolio Geometric Return:</span><span className={`font-semibold ${allocationsValid ? 'text-green-300' : 'text-slate-500'}`}>{allocationsValid ? expectedReturn.toFixed(2) + '%' : '-'}</span></div>
+              <div className="flex justify-between gap-6"><span>Portfolio Arithmetic Return:</span><span className={`font-semibold ${allocationsValid ? 'text-green-300' : 'text-slate-500'}`}>{allocationsValid ? expectedReturn.toFixed(2) + '%' : '-'}</span></div>
               <div className="flex justify-between gap-6"><span>Portfolio Std Deviation:</span><span className={`font-semibold ${allocationsValid ? 'text-green-300' : 'text-slate-500'}`}>{allocationsValid ? stdDev.toFixed(2) + '%' : '-'}</span></div>
             </div>
           </div>
@@ -2391,7 +2386,7 @@ function App() {
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="text-center bg-slate-800/50 rounded-xl p-4">
-                  <div className="text-sm text-slate-400 mb-1">Geometric Return</div>
+                  <div className="text-sm text-slate-400 mb-1">Arithmetic Return</div>
                   <div className="text-xl font-semibold text-green-300">{expectedReturn.toFixed(2)}%</div>
                 </div>
                 <div className="text-center bg-slate-800/50 rounded-xl p-4">
