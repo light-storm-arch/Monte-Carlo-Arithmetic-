@@ -738,9 +738,10 @@ const generateReturn = (geometricMean, simpleStdDev, z) => {
   // (probability of |z| > 5 is ~0.00006%, essentially never happens naturally)
   z = Math.max(-5, Math.min(5, z));
 
-  // Use geometric mean directly as the normal distribution mean
-  // No variance-drag adjustment — input geometric mean = mean of annual returns
-  const arithmeticMean = geometricMean;
+  // Convert geometric mean to arithmetic mean: μ = g + σ²/(2(1+g))
+  // Uses simple-return std dev; dividing by (1+g) corrects for the difference
+  // between simple and log return volatility so compound growth ≈ geometric mean
+  const arithmeticMean = geometricMean + (simpleStdDev ** 2) / (2 * (1 + geometricMean));
 
   // Normal return: R ~ N(μ, σ²)
   const simpleReturn = arithmeticMean + simpleStdDev * z;
