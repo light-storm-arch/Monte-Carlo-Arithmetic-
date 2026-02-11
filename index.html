@@ -117,8 +117,9 @@ const UNIFORM_LIFETIME_TABLE = {
 // UTILITIES: RMD & Tax Bracket Functions
 // =============================================================================
 // Calculate RMD for a given age and account balance
-const calculateRMD = (age, preTaxBalance) => {
-  if (age < 73 || preTaxBalance <= 0) return 0;
+// rmdStartAge: 73 for birth years 1951-1959, 75 for birth year 1960+
+const calculateRMD = (age, preTaxBalance, rmdStartAge = 73) => {
+  if (age < rmdStartAge || preTaxBalance <= 0) return 0;
   const divisor = UNIFORM_LIFETIME_TABLE[Math.min(age, 120)] || 2.0;
   return preTaxBalance / divisor;
 };
@@ -204,24 +205,25 @@ const calculateCapitalGainsTax = (capitalGains, ordinaryTaxableIncome, capGainsB
 // This solves: grossWithdrawal + taxFreeIncome - totalTax = spendingNeed
 // Where totalTax is calculated on: withdrawals + taxableIncome + socialSecurity + dividends + interest
 const calculateUnifiedWithdrawal = (spendingNeed, totalIncome, taxParams) => {
-  const { 
+  const {
     client1PreTax, client2PreTax, totalPreTax,
     client1Roth, client2Roth, totalRoth,
     totalTaxable, taxableBasis, stockAllocation,
     filingStatus, stateTaxRate, baseInflation, yearsFromStart,
-    client1Age, client2Age, otherIncome, socialSecurityIncome, taxFreeIncome,
+    client1Age, client2Age, client1RmdAge, client2RmdAge,
+    otherIncome, socialSecurityIncome, taxFreeIncome,
     cachedBrackets, cachedCapGainsBrackets, cachedDeduction, cachedTopOf12
   } = taxParams;
-  
+
   const brackets = cachedBrackets || getInflatedBrackets(filingStatus, baseInflation, yearsFromStart);
   const capGainsBrackets = cachedCapGainsBrackets || getInflatedCapGainsBrackets(filingStatus, baseInflation, yearsFromStart);
   const standardDeduction = cachedDeduction || getInflatedStandardDeduction(filingStatus, baseInflation, yearsFromStart);
   const topOf12Bracket = cachedTopOf12 || getTopOf12PercentBracket(filingStatus, baseInflation, yearsFromStart);
-  
+
   // Calculate RMDs (mandatory regardless of spending need)
   // Always calculate both - deceased spouse will have age=0 and balance=0, so RMD=0
-  const client1RMD = calculateRMD(client1Age, client1PreTax);
-  const client2RMD = calculateRMD(client2Age, client2PreTax);
+  const client1RMD = calculateRMD(client1Age, client1PreTax, client1RmdAge || 73);
+  const client2RMD = calculateRMD(client2Age, client2PreTax, client2RmdAge || 73);
   const totalRMD = client1RMD + client2RMD;
   
   // Calculate taxable account income (dividends and interest) - always generated
@@ -330,26 +332,27 @@ const calculateUnifiedWithdrawal = (spendingNeed, totalIncome, taxParams) => {
 
 // Main withdrawal calculation with RMDs and bracket-filling optimization
 const calculateOptimizedWithdrawal = (targetAfterTax, accountBalances, taxParams) => {
-  const { 
+  const {
     client1PreTax, client2PreTax, totalPreTax,
     client1Roth, client2Roth, totalRoth,
     totalTaxable, taxableBasis, stockAllocation,
     filingStatus, stateTaxRate, baseInflation, yearsFromStart,
-    client1Age, client2Age, otherIncome, socialSecurityIncome,
+    client1Age, client2Age, client1RmdAge, client2RmdAge,
+    otherIncome, socialSecurityIncome,
     // Cached values (optional - for performance)
     cachedBrackets, cachedCapGainsBrackets, cachedDeduction, cachedTopOf12
   } = taxParams;
-  
+
   // Use cached values if provided, otherwise calculate
   const brackets = cachedBrackets || getInflatedBrackets(filingStatus, baseInflation, yearsFromStart);
   const capGainsBrackets = cachedCapGainsBrackets || getInflatedCapGainsBrackets(filingStatus, baseInflation, yearsFromStart);
   const standardDeduction = cachedDeduction || getInflatedStandardDeduction(filingStatus, baseInflation, yearsFromStart);
   const topOf12Bracket = cachedTopOf12 || getTopOf12PercentBracket(filingStatus, baseInflation, yearsFromStart);
-  
+
   // Step 1: Calculate RMDs (mandatory pre-tax withdrawals)
   // Always calculate both - deceased spouse will have age=0 and balance=0, so RMD=0
-  const client1RMD = calculateRMD(client1Age, client1PreTax);
-  const client2RMD = calculateRMD(client2Age, client2PreTax);
+  const client1RMD = calculateRMD(client1Age, client1PreTax, client1RmdAge || 73);
+  const client2RMD = calculateRMD(client2Age, client2PreTax, client2RmdAge || 73);
   const totalRMD = client1RMD + client2RMD;
   
   // Step 2: Calculate taxable account income (dividends and interest)
@@ -513,19 +516,30 @@ const calculateWithdrawalAllocation = (
   // Ordinary income = pre-tax withdrawals + interest income + other income + taxable SS
   const ordinaryIncome = fromPreTax + interestIncome + otherIncome + taxableSocialSecurity;
   const taxableOrdinaryIncome = Math.max(0, ordinaryIncome - standardDeduction);
-  
+
   // Capital gains = taxable withdrawal gains + qualified dividends
   const taxableWithdrawalGains = fromTaxable * taxableGainRatio;
   const totalCapitalGains = taxableWithdrawalGains + qualifiedDividends;
-  
+
   // Federal taxes
   const federalOrdinaryTax = calculateFederalTax(taxableOrdinaryIncome, brackets);
   const federalCapGainsTax = calculateCapitalGainsTax(totalCapitalGains, taxableOrdinaryIncome, capGainsBrackets);
-  const federalTax = federalOrdinaryTax + federalCapGainsTax;
-  
+
+  // NIIT (Net Investment Income Tax) - 3.8% on investment income for high earners
+  // Applies to lesser of: net investment income OR (MAGI - threshold)
+  // Thresholds: $200k single/HoH, $250k MFJ (not inflation-adjusted)
+  const niitThreshold = filingStatus === 'mfj' ? 250000 : 200000;
+  const netInvestmentIncome = interestIncome + qualifiedDividends + taxableWithdrawalGains;
+  // MAGI for NIIT is approximately AGI (gross income before deductions)
+  const magiForNiit = ordinaryIncome + totalCapitalGains;
+  const magiOverThreshold = Math.max(0, magiForNiit - niitThreshold);
+  const niitTax = 0.038 * Math.min(netInvestmentIncome, magiOverThreshold);
+
+  const federalTax = federalOrdinaryTax + federalCapGainsTax + niitTax;
+
   // State tax (flat rate on taxable income after standard deduction + capital gains)
   const stateTax = (taxableOrdinaryIncome + totalCapitalGains) * stateTaxRate;
-  
+
   const totalTax = federalTax + stateTax;
   const actualGrossWithdrawal = fromPreTax + fromTaxable + fromRoth;
   const afterTax = actualGrossWithdrawal - totalTax;
@@ -548,6 +562,7 @@ const calculateWithdrawalAllocation = (
     federalTax,
     federalOrdinaryTax,
     federalCapGainsTax,
+    niitTax,
     stateTax,
     afterTax,
     taxableOrdinaryIncome,
@@ -596,8 +611,8 @@ const ASSET_CLASSES = [
   'Small Cap Stocks', "Int'l Developed Stocks", "Int'l Emerging Stocks",
   'REITs', 'Commodities'
 ];
-const ASSET_RETURNS = [0.0331, 0.0408, 0.0467, 0.0548, 0.0850, 0.0867, 0.0877, 0.0934, 0.0934, 0.1138, 0.0866, 0.0630]; // arithmetic (simple) mean returns
-const ASSET_STDDEVS = [0.015, 0.04, 0.06, 0.10, 0.18, 0.19, 0.19, 0.21, 0.20, 0.26, 0.23, 0.22]; // arithmetic standard deviations (annualized std dev of simple returns)
+const ASSET_RETURNS = [0.0330, 0.0400, 0.0450, 0.0500, 0.0700, 0.0700, 0.0710, 0.0730, 0.0750, 0.0830, 0.0620, 0.0400]; // geometric (compound) returns - median compound return will equal these values
+const ASSET_STDDEVS = [0.015, 0.04, 0.06, 0.10, 0.18, 0.19, 0.19, 0.21, 0.20, 0.26, 0.23, 0.22]; // simple return standard deviations (annualized std dev of simple returns)
 const ASSET_CORR_MATRIX = [
   [1.00, 0.40, 0.10, 0.00,-0.05,-0.05,-0.10,-0.10, 0.00, 0.00,-0.10, 0.10],
   [0.40, 1.00, 0.40, 0.50, 0.00, 0.00, 0.00,-0.10, 0.20, 0.10, 0.10, 0.20],
@@ -706,22 +721,36 @@ const ASSET_CORR_FIXED = ensurePositiveDefinite(ASSET_CORR_MATRIX);
 const CHOLESKY_L = choleskyDecomposition(ASSET_CORR_FIXED);
 if (!CHOLESKY_L) console.error('Failed to compute Cholesky decomposition of asset correlation matrix!');
 
-// Normal distribution return generator: uses arithmetic mean and standard deviation
-// Takes arithmetic (simple) mean and arithmetic volatility as inputs
+// Log-normal return generator: ensures median compound return equals geometric mean
+// Takes geometric (compound) mean and simple return standard deviation as inputs
+// Internally converts simple std dev to log std dev for the lognormal model
 // If z is provided, uses it directly; otherwise generates via Box-Muller
-// Returns are floored at -99% to prevent impossible scenarios
-const generateReturn = (arithmeticMean, volatility, z) => {
+const generateReturn = (geometricMean, simpleStdDev, z) => {
   // Generate standard normal random number (Box-Muller) if not provided
   if (z === undefined) {
-    const u1 = Math.random(), u2 = Math.random();
+    // Guard against Math.random() returning exactly 0 (causes log(0) = -Infinity)
+    const u1 = Math.random() || 1e-15, u2 = Math.random();
     z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
   }
 
-  // Normal distribution: return = mean + volatility * z
-  const simpleReturn = arithmeticMean + volatility * z;
+  // Clamp z to ±5 standard deviations to prevent extreme outliers
+  // (probability of |z| > 5 is ~0.00006%, essentially never happens naturally)
+  z = Math.max(-5, Math.min(5, z));
 
-  // Floor at -99% to prevent impossible negative portfolio values
-  return Math.max(simpleReturn, -0.99);
+  // Convert simple std dev to log std dev: σ_log = sqrt(ln(1 + (σ_simple / (1 + g))²))
+  // This ensures the simple return distribution has the correct standard deviation
+  const logVolatility = Math.sqrt(Math.log(1 + (simpleStdDev / (1 + geometricMean)) ** 2));
+
+  // Convert geometric mean to log return mean: μ_log = ln(1 + g)
+  // This ensures the median of (1 + R) equals (1 + g)
+  const logMean = Math.log(1 + geometricMean);
+
+  // Log return: normally distributed with mean μ_log and std dev σ_log
+  const logReturn = logMean + logVolatility * z;
+
+  // Convert to simple return: R = exp(log_return) - 1
+  // Note: exp() ensures return > -100% (can't lose more than everything)
+  return Math.exp(logReturn) - 1;
 };
 
 // =============================================================================
@@ -775,7 +804,13 @@ const PercentageInputNullable = ({ value, onChange, placeholder }) => {
 // SIMULATION ENGINE: Monte Carlo & Guardrail Analysis
 // =============================================================================
 const runSimulation = (params, numSims) => {
-  const { preTaxBalance, rothBalance, taxableBalance, taxableBasis, stockAllocation, filingStatus, stateTaxRate, planLength, assetWeights, choleskyL, baseSpending, survivorSpending, baseInflation, goals, incomeSources, currentYear, spendingMode, phase2Year, phase2Reduction, phase3Year, phase3Reduction, clientAge, client1Age, client2Age, client1PreTax, client2PreTax, client1Roth, client2Roth, client1PlanLength, client2PlanLength } = params;
+  const { preTaxBalance, rothBalance, taxableBalance, taxableBasis, stockAllocation, filingStatus, stateTaxRate, planLength, assetWeights, choleskyL, baseSpending, survivorSpending, baseInflation, goals, incomeSources, currentYear, spendingMode, phase2Year, phase2Reduction, phase3Year, phase3Reduction, clientAge, client1Age, client2Age, client1RmdAge, client2RmdAge, client1PreTax, client2PreTax, client1Roth, client2Roth, client1PlanLength, client2PlanLength } = params;
+
+  // Validate Cholesky decomposition was successful before running simulation
+  if (!choleskyL) {
+    throw new Error('Simulation failed: Cholesky decomposition of correlation matrix is null. The asset correlation matrix may not be positive-definite.');
+  }
+
   const results = [], allPaths = [];
   const totalPortfolio = preTaxBalance + rothBalance + taxableBalance;
   
@@ -1021,7 +1056,8 @@ const runSimulation = (params, numSims) => {
       // Step 1: Generate independent standard normals via Box-Muller (need 12, so 6 pairs)
       const zIndep = new Array(NUM_ASSETS);
       for (let k = 0; k < NUM_ASSETS; k += 2) {
-        const ua = Math.random(), ub = Math.random();
+        // Guard against Math.random() returning exactly 0 (causes log(0) = -Infinity)
+        const ua = Math.random() || 1e-15, ub = Math.random();
         const r = Math.sqrt(-2 * Math.log(ua));
         zIndep[k] = r * Math.cos(2 * Math.PI * ub);
         if (k + 1 < NUM_ASSETS) zIndep[k + 1] = r * Math.sin(2 * Math.PI * ub);
@@ -1059,13 +1095,17 @@ const runSimulation = (params, numSims) => {
       // Rebalancing happens implicitly: next iteration starts fresh with target weights
       // This models annual rebalancing back to target allocation
 
-      // Beginning-of-year withdrawals: withdrawals happen before returns are applied
+      // =========================================================================
+      // BEGINNING OF YEAR: Process all withdrawals and income BEFORE applying returns
+      // This is more conservative and simpler than mid-year timing
+      // =========================================================================
+
       // Calculate gross withdrawal needed for target after-tax spending
       // All taxes (on income, withdrawals, dividends, interest) are calculated together
       let grossWithdrawal = 0, fromTaxable = 0, fromPreTax = 0, fromRoth = 0, totalTax = 0, federalTax = 0, stateTax = 0;
       let client1RMD = 0, client2RMD = 0, totalRMD = 0, excessRMDAfterTax = 0;
       let netIncome = 0, excessIncome = 0;
-      
+
       // Spending need (gross) - income will offset this in the withdrawal calculation
       const spendingNeed = yearSpending + yearGoals;
       
@@ -1099,6 +1139,8 @@ const runSimulation = (params, numSims) => {
         yearsFromStart: year,
         client1Age: c1Age,
         client2Age: c2Age,
+        client1RmdAge: client1RmdAge || 73,
+        client2RmdAge: client2RmdAge || 73,
         otherIncome: taxableIncome,
         socialSecurityIncome: socialSecurityIncome,
         taxFreeIncome: taxFreeIncome,
@@ -1136,6 +1178,7 @@ const runSimulation = (params, numSims) => {
         totalCapitalGains: withdrawal.totalCapitalGains || 0,
         federalOrdinaryTax: withdrawal.federalOrdinaryTax || 0,
         federalCapGainsTax: withdrawal.federalCapGainsTax || 0,
+        niitTax: withdrawal.niitTax || 0,
         standardDeduction: cachedDeductions[year],
         taxableWithdrawalGains: fromTaxable > 0 && taxable > 0 ? fromTaxable * (1 - basis / taxable) : 0,
         filingStatus: currentFilingStatus,
@@ -1197,7 +1240,7 @@ const runSimulation = (params, numSims) => {
       // Check if we ran out of money
       if (afterWithdrawal < 0 || (spendingNeed > 0 && afterWithdrawal < spendingNeed * 0.1)) {
         detailedPath.push({ year, calYear, age: c1Age, age2: c2Age, startBalance, yearReturn, yearSpending, yearGoals, yearIncome, grossWithdrawal, fromTaxable, fromPreTax, fromRoth, totalTax, federalTax, stateTax, client1RMD, client2RMD, totalRMD, taxDetails, afterWithdrawal: 0, endBalance: 0, endPreTax: 0, endRoth: 0, endTaxable: 0 });
-        success = false; 
+        success = false;
         path.push(0);
         for (let r = year + 1; r < planLength; r++) {
           path.push(0);
@@ -1209,13 +1252,16 @@ const runSimulation = (params, numSims) => {
         break;
       }
       
-      // Apply full year's return after withdrawals (beginning-of-year withdrawal model)
+      // =========================================================================
+      // END OF YEAR: Apply full year's return AFTER all withdrawals/income processed
+      // =========================================================================
       c1PreTax *= (1 + yearReturn);
       c2PreTax *= (1 + yearReturn);
       c1Roth *= (1 + yearReturn);
       c2Roth *= (1 + yearReturn);
       taxable *= (1 + yearReturn);
-      basis *= (1 + yearReturn);
+      // Note: basis does NOT change with market returns - it only changes when buying/selling
+      // When basis > taxable (unrealized loss), gain ratio is 0 so no tax on withdrawals
 
       const endBalance = totalBalance();
       path.push(endBalance);
@@ -1223,21 +1269,82 @@ const runSimulation = (params, numSims) => {
     }
     
     const endingValue = totalBalance();
-    results.push({ success, endingValue, path, detailedPath });
+
+    // Calculate return-based CAGR from yearReturn values (pure market returns)
+    // Only count years with actual returns (before failure), not zero-padded years after failure
+    let compoundReturn = 1;
+    let actualYears = 0;
+    for (const yearData of detailedPath) {
+      // Count year if it had actual market activity (startBalance > 0 or it's the first year)
+      if (yearData.startBalance > 0 || actualYears === 0) {
+        compoundReturn *= (1 + yearData.yearReturn);
+        actualYears++;
+      }
+    }
+    // Use actual years for CAGR calculation, with minimum of 1 to avoid division by zero
+    const returnCAGR = actualYears > 0 ? Math.pow(compoundReturn, 1 / actualYears) - 1 : 0;
+
+    results.push({ success, endingValue, path, detailedPath, returnCAGR });
     allPaths.push(path);
   }
-  
+
   const successRate = results.filter(r => r.success).length / numSims;
   const endingValues = results.map(r => r.endingValue).sort((a, b) => a - b);
   const getPercentile = (arr, p) => arr[Math.min(Math.floor(arr.length * p), arr.length - 1)];
   const sortedResults = [...results].sort((a, b) => a.endingValue - b.endingValue);
   const percentilePaths = {}, percentileDetails = {};
-  [0.1, 0.25, 0.5, 0.75, 0.9].forEach(p => { 
+  [0.1, 0.25, 0.5, 0.75, 0.9, 0.99].forEach(p => {
     const idx = Math.min(Math.floor(sortedResults.length * p), sortedResults.length - 1);
-    percentilePaths[`p${Math.round(p * 100)}`] = sortedResults[idx].path; 
+    percentilePaths[`p${Math.round(p * 100)}`] = sortedResults[idx].path;
     percentileDetails[`p${Math.round(p * 100)}`] = sortedResults[idx].detailedPath;
   });
-  return { successRate, percentileEnding: { p10: getPercentile(endingValues, 0.1), p25: getPercentile(endingValues, 0.25), p50: getPercentile(endingValues, 0.5), p75: getPercentile(endingValues, 0.75), p90: getPercentile(endingValues, 0.9) }, percentilePaths, percentileDetails };
+
+  // Calculate return distribution percentiles (sorted by CAGR, not ending value)
+  const sortedByReturn = [...results].sort((a, b) => a.returnCAGR - b.returnCAGR);
+  const returnPercentiles = {};
+  const returnPercentileDetails = {};
+
+  [0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99].forEach(p => {
+    const idx = Math.min(Math.floor(sortedByReturn.length * p), sortedByReturn.length - 1);
+    const sim = sortedByReturn[idx];
+    const key = `p${Math.round(p * 100)}`;
+
+    // Calculate statistics for this simulation
+    const returns = sim.detailedPath.map(d => d.yearReturn);
+    const arithmeticMean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+    const variance = returns.reduce((sum, r) => sum + Math.pow(r - arithmeticMean, 2), 0) / returns.length;
+    const stdDev = Math.sqrt(variance);
+
+    // Build year-by-year data with running CAGR
+    let cumulative = 1;
+    const yearByYear = sim.detailedPath.map((d, i) => {
+      cumulative *= (1 + d.yearReturn);
+      const cagrToDate = Math.pow(cumulative, 1 / (i + 1)) - 1;
+      return {
+        year: d.year,
+        calYear: d.calYear,
+        annualReturn: d.yearReturn,
+        cagrToDate
+      };
+    });
+
+    returnPercentiles[key] = sim.returnCAGR;
+    returnPercentileDetails[key] = {
+      cagr: sim.returnCAGR,
+      arithmeticMean,
+      stdDev,
+      yearByYear
+    };
+  });
+
+  return {
+    successRate,
+    percentileEnding: { p10: getPercentile(endingValues, 0.1), p25: getPercentile(endingValues, 0.25), p50: getPercentile(endingValues, 0.5), p75: getPercentile(endingValues, 0.75), p90: getPercentile(endingValues, 0.9), p99: getPercentile(endingValues, 0.99) },
+    percentilePaths,
+    percentileDetails,
+    returnPercentiles,
+    returnPercentileDetails
+  };
 };
 
 const findPortfolioForSuccessRate = (params, targetRate, numSims) => {
@@ -1259,8 +1366,8 @@ const findPortfolioForSuccessRate = (params, targetRate, numSims) => {
       client1Roth: (params.client1Roth || 0) * scale,
       client2Roth: (params.client2Roth || 0) * scale
     };
-    const r = runSimulation(scaledParams, Math.min(numSims, 2000)); 
-    if (Math.abs(r.successRate - targetRate) < 0.005) return mid; 
+    const r = runSimulation(scaledParams, numSims);
+    if (Math.abs(r.successRate - targetRate) < 0.005) return mid;
     if (r.successRate < targetRate) low = mid; else high = mid; 
   }
   return (low + high) / 2;
@@ -1288,7 +1395,7 @@ const findSpendingForSuccessRate = (params, pv, targetRate, numSims) => {
   for (let i = 0; i < 15; i++) {
     const mid = (low + high) / 2;
     const scaledSurvivor = survivorRatio != null ? mid * survivorRatio : null;
-    const r = runSimulation({ ...scaledParams, baseSpending: mid, survivorSpending: scaledSurvivor }, Math.min(numSims, 2000));
+    const r = runSimulation({ ...scaledParams, baseSpending: mid, survivorSpending: scaledSurvivor }, numSims);
     if (Math.abs(r.successRate - targetRate) < 0.005) return mid;
     if (r.successRate > targetRate) low = mid; else high = mid;
   }
@@ -1368,7 +1475,7 @@ const generatePDF = (inputs, results) => {
   html += '<h2>Financial Assumptions</h2>';
   html += '<div class="grid-2"><div class="card"><div class="assumptions-row"><span>Base Annual Spending (After-Tax)</span><strong>' + formatCurrency(baseSpending) + '</strong></div>';
   if (survivorSpending != null) html += '<div class="assumptions-row"><span>Survivor Annual Spending (After-Tax)</span><strong>' + formatCurrency(survivorSpending) + '</strong></div>';
-  html += '<div class="assumptions-row"><span>Portfolio Arithmetic Return</span><strong>' + (expectedReturn * 100).toFixed(2) + '%</strong></div>';
+  html += '<div class="assumptions-row"><span>Portfolio Geometric Return</span><strong>' + (expectedReturn * 100).toFixed(2) + '%</strong></div>';
   html += '<div class="assumptions-row"><span>Portfolio Std Deviation</span><strong>' + (stdDev * 100).toFixed(2) + '%</strong></div>';
   html += '<div class="assumptions-row"><span>Base Inflation Rate</span><strong>' + (baseInflation * 100).toFixed(2) + '%</strong></div>';
   html += '<div class="assumptions-row"><span>Target Success Rate</span><strong>' + (targetSuccessRate * 100).toFixed(0) + '%</strong></div>';
@@ -1425,11 +1532,12 @@ const generatePDF = (inputs, results) => {
   
   // Ending Portfolio Percentiles
   html += '<h2>Ending Portfolio Percentiles</h2>';
-  html += '<div class="grid" style="grid-template-columns:repeat(5,1fr)"><div class="card" style="text-align:center"><div class="label">10th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p10) + '</div></div>';
+  html += '<div class="grid" style="grid-template-columns:repeat(6,1fr)"><div class="card" style="text-align:center"><div class="label">10th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p10) + '</div></div>';
   html += '<div class="card" style="text-align:center"><div class="label">25th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p25) + '</div></div>';
   html += '<div class="card" style="text-align:center"><div class="label">50th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p50) + '</div></div>';
   html += '<div class="card" style="text-align:center"><div class="label">75th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p75) + '</div></div>';
-  html += '<div class="card" style="text-align:center"><div class="label">90th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p90) + '</div></div></div>';
+  html += '<div class="card" style="text-align:center"><div class="label">90th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p90) + '</div></div>';
+  html += '<div class="card" style="text-align:center"><div class="label">99th</div><div class="value" style="font-size:18px">' + formatCurrency(percentileEnding.p99) + '</div></div></div>';
   
   // Guardrails
   html += '<h2>Guardrail Analysis</h2><div class="grid-2"><div class="card" style="border-left-color:#4caf50"><div class="label">Upper Guardrail (' + (upperGuardrail * 100).toFixed(0) + '% Success)</div><div class="assumptions-row"><span>Portfolio Value</span><strong>' + formatCurrency(upperGuardrailPortfolio) + '</strong></div><div class="assumptions-row"><span>New Base Spending</span><strong>' + formatCurrency(upperGuardrailSpending) + '</strong></div>' + (survivorRatio != null ? '<div class="assumptions-row"><span>Survivor Spending</span><strong>' + formatCurrency(upperGuardrailSpending * survivorRatio) + '</strong></div>' : '') + '<div class="assumptions-row"><span>Spending Change</span><strong style="color:#4caf50">+' + formatCurrency(upperGuardrailSpending - baseSpending) + '</strong></div></div>';
@@ -1454,10 +1562,12 @@ function App() {
   const [client1Name, setClient1Name] = useState('');
   const [client1Age, setClient1Age] = useState(60);
   const [client1PlanLength, setClient1PlanLength] = useState(30);
+  const [client1RmdAge, setClient1RmdAge] = useState(73); // 73 for birth years 1951-1959, 75 for 1960+
   const [client2Name, setClient2Name] = useState('');
   const [client2Age, setClient2Age] = useState(58);
   const [client2PlanLength, setClient2PlanLength] = useState(32);
-  
+  const [client2RmdAge, setClient2RmdAge] = useState(75); // Default to 75 for younger spouse
+
   // Filing status (moved from Tax Settings)
   const [filingStatus, setFilingStatus] = useState('mfj');
   
@@ -1478,7 +1588,11 @@ function App() {
   
   // Account helper functions
   const addAccount = () => setAccounts([...accounts, { id: Date.now(), type: 'pretax', balance: 0, owner: 'client1', costBasis: 0, stockAllocation: 60 }]);
-  const updateAccount = (id, field, value) => setAccounts(accounts.map(a => a.id === id ? { ...a, [field]: value } : a));
+  const updateAccount = (id, field, value) => {
+    // Validate stockAllocation to be between 0 and 100
+    const sanitizedValue = field === 'stockAllocation' ? Math.max(0, Math.min(100, value)) : value;
+    setAccounts(accounts.map(a => a.id === id ? { ...a, [field]: sanitizedValue } : a));
+  };
   const removeAccount = (id) => setAccounts(accounts.filter(a => a.id !== id));
   
   // Computed totals from accounts
@@ -1536,7 +1650,7 @@ function App() {
   const [targetSuccessRate, setTargetSuccessRate] = useState(80);
   const [upperGuardrail, setUpperGuardrail] = useState(90);
   const [lowerGuardrail, setLowerGuardrail] = useState(70);
-  const [numSimulations, setNumSimulations] = useState(1500);
+  const [numSimulations, setNumSimulations] = useState(2000);
   const [goals, setGoals] = useState([]);
   const [incomeSources, setIncomeSources] = useState([]);
   const [results, setResults] = useState(null);
@@ -1572,6 +1686,8 @@ function App() {
   const [taxVerificationYear, setTaxVerificationYear] = useState(0);
   const [accountBalancesOpen, setAccountBalancesOpen] = useState(false);
   const [accountBalancesPercentile, setAccountBalancesPercentile] = useState('p50');
+  const [returnDistributionOpen, setReturnDistributionOpen] = useState(false);
+  const [returnDistributionPercentile, setReturnDistributionPercentile] = useState('p50');
 
   const calculate = useCallback(() => {
     setIsCalculating(true);
@@ -1584,6 +1700,7 @@ function App() {
         baseSpending, survivorSpending: filingStatus === 'mfj' ? (survivorSpending !== null ? survivorSpending : baseSpending) : null,
         baseInflation: baseInflation / 100, goals, incomeSources,
         currentYear, clientAge, client1Age, client2Age: filingStatus === 'mfj' ? client2Age : 0,
+        client1RmdAge, client2RmdAge: filingStatus === 'mfj' ? client2RmdAge : client1RmdAge,
         client1PlanLength, client2PlanLength: filingStatus === 'mfj' ? client2PlanLength : client1PlanLength,
         spendingMode,
         phase2Year, phase2Reduction: phase2Reduction / 100,
@@ -1618,15 +1735,15 @@ function App() {
       
       const chartData = [];
       for (let y = 0; y <= planLength; y++) {
-        chartData.push({ year: currentYear + y, p10: mainResult.percentilePaths.p10[y], p25: mainResult.percentilePaths.p25[y], p50: mainResult.percentilePaths.p50[y], p75: mainResult.percentilePaths.p75[y], p90: mainResult.percentilePaths.p90[y] });
+        chartData.push({ year: currentYear + y, p10: mainResult.percentilePaths.p10[y], p25: mainResult.percentilePaths.p25[y], p50: mainResult.percentilePaths.p50[y], p75: mainResult.percentilePaths.p75[y], p90: mainResult.percentilePaths.p90[y], p99: mainResult.percentilePaths.p99[y] });
       }
       // Compute survivor spending ratio for guardrail display (only if different from base)
       const hasDifferentSurvivorSpending = filingStatus === 'mfj' && survivorSpending !== null && survivorSpending !== baseSpending;
       const survivorRatio = hasDifferentSurvivorSpending && baseSpending > 0 ? survivorSpending / baseSpending : null;
-      setResults({ currentSuccess: mainResult.successRate, upperGuardrailPortfolio: upperPortfolio, upperGuardrailSpending: upperSpending, lowerGuardrailPortfolio: lowerPortfolio, lowerGuardrailSpending: lowerSpending, survivorRatio, percentileEnding: mainResult.percentileEnding, chartData, percentileDetails: mainResult.percentileDetails });
+      setResults({ currentSuccess: mainResult.successRate, upperGuardrailPortfolio: upperPortfolio, upperGuardrailSpending: upperSpending, lowerGuardrailPortfolio: lowerPortfolio, lowerGuardrailSpending: lowerSpending, survivorRatio, percentileEnding: mainResult.percentileEnding, chartData, percentileDetails: mainResult.percentileDetails, returnPercentiles: mainResult.returnPercentiles, returnPercentileDetails: mainResult.returnPercentileDetails });
       setIsCalculating(false);
     }, 100);
-  }, [preTaxBalance, rothBalance, taxableBalance, taxableBasis, client1PreTax, client2PreTax, client1Roth, client2Roth, stockAllocation, filingStatus, stateTaxRate, totalPortfolio, planLength, assetWeights, baseSpending, survivorSpending, baseInflation, goals, incomeSources, currentYear, clientAge, client1Age, client2Age, numSimulations, targetSuccessRate, upperGuardrail, lowerGuardrail, spendingMode, phase2Year, phase2Reduction, phase3Year, phase3Reduction, client1PlanLength, client2PlanLength, accounts]);
+  }, [preTaxBalance, rothBalance, taxableBalance, taxableBasis, client1PreTax, client2PreTax, client1Roth, client2Roth, stockAllocation, filingStatus, stateTaxRate, totalPortfolio, planLength, assetWeights, baseSpending, survivorSpending, baseInflation, goals, incomeSources, currentYear, clientAge, client1Age, client2Age, client1RmdAge, client2RmdAge, numSimulations, targetSuccessRate, upperGuardrail, lowerGuardrail, spendingMode, phase2Year, phase2Reduction, phase3Year, phase3Reduction, client1PlanLength, client2PlanLength, accounts]);
 
   const exportPDF = () => { if (results) generatePDF({ currentYear, client1Name, client1Age, client1PlanLength, client2Name, client2Age, client2PlanLength, planLength, accounts, preTaxBalance, rothBalance, taxableBalance, taxableBasis, stockAllocation, filingStatus, stateTaxRate, totalPortfolio, expectedReturn: expectedReturn / 100, stdDev: stdDev / 100, assetAllocations, baseInflation: baseInflation / 100, baseSpending, survivorSpending: filingStatus === 'mfj' && survivorSpending !== null && survivorSpending !== baseSpending ? survivorSpending : null, targetSuccessRate: targetSuccessRate / 100, upperGuardrail: upperGuardrail / 100, lowerGuardrail: lowerGuardrail / 100, goals, incomeSources, numSimulations, spendingMode, phase2Year, phase2Reduction, phase3Year, phase3Reduction }, results); };
 
@@ -1634,7 +1751,7 @@ function App() {
   const exportVerificationPDF = (percentile) => {
     if (!results || !results.percentileDetails || !results.percentileDetails[percentile]) return;
     const data = results.percentileDetails[percentile];
-    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : '90th';
+    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : percentile === 'p90' ? '90th' : '99th';
     
     let html = '<!DOCTYPE html><html><head><title>Verification Details - ' + percentileLabel + ' Percentile</title>';
     html += '<style>body{font-family:Arial,sans-serif;padding:30px;color:#333;font-size:11px}h1{color:#0f4c5c;font-size:18px}h2{color:#0f4c5c;font-size:14px;margin-top:20px}table{width:100%;border-collapse:collapse;margin:15px 0}th{background:#0f4c5c;color:white;padding:6px 4px;text-align:right;font-size:10px}th:first-child{text-align:left}td{padding:5px 4px;border-bottom:1px solid #ddd;text-align:right;font-size:10px}td:first-child{text-align:left}.negative{color:#dc2626}.positive{color:#16a34a}tr:nth-child(even){background:#f9f9f9}.meta{color:#666;font-size:11px;margin-bottom:15px}</style></head><body>';
@@ -1688,7 +1805,7 @@ function App() {
     const yearData = results.percentileDetails[percentile][yearIndex];
     if (!yearData) return;
     const td = yearData.taxDetails || {};
-    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : '90th';
+    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : percentile === 'p90' ? '90th' : '99th';
     const filingLabel = td.filingStatus === 'single' ? 'Single' : td.filingStatus === 'mfj' ? 'Married Filing Jointly' : 'Head of Household';
     
     let html = '<!DOCTYPE html><html><head><title>Tax Calculation - Year ' + yearData.calYear + '</title>';
@@ -1750,6 +1867,9 @@ function App() {
     html += '<h2>Federal Tax Calculation</h2><div class="section">';
     html += '<div class="row"><span class="label">Tax on Ordinary Income</span><span class="value negative">' + formatCurrency(td.federalOrdinaryTax || 0) + '</span></div>';
     html += '<div class="row"><span class="label">Tax on Capital Gains</span><span class="value negative">' + formatCurrency(td.federalCapGainsTax || 0) + '</span></div>';
+    if ((td.niitTax || 0) > 0) {
+      html += '<div class="row"><span class="label">Net Investment Income Tax (3.8%)</span><span class="value negative">' + formatCurrency(td.niitTax) + '</span></div>';
+    }
     html += '<div class="row total"><span class="label">Total Federal Tax</span><span class="value negative">' + formatCurrency(yearData.federalTax) + '</span></div>';
     html += '</div>';
     
@@ -1826,7 +1946,7 @@ function App() {
   const exportTaxTablePDF = (percentile) => {
     if (!results || !results.percentileDetails || !results.percentileDetails[percentile]) return;
     const data = results.percentileDetails[percentile];
-    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : '90th';
+    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : percentile === 'p90' ? '90th' : '99th';
     
     let html = '<!DOCTYPE html><html><head><title>Tax Summary - ' + percentileLabel + ' Percentile</title>';
     html += '<style>body{font-family:Arial,sans-serif;padding:30px;color:#333;font-size:10px}h1{color:#0f4c5c;font-size:18px}table{width:100%;border-collapse:collapse;margin:15px 0}th{background:#0f4c5c;color:white;padding:6px 4px;text-align:right;font-size:9px}th:first-child,th:nth-child(2){text-align:left}td{padding:4px;border-bottom:1px solid #ddd;text-align:right;font-size:9px}td:first-child,td:nth-child(2){text-align:left}.negative{color:#dc2626}tr:nth-child(even){background:#f9f9f9}.meta{color:#666;font-size:11px;margin-bottom:15px}</style></head><body>';
@@ -1872,7 +1992,7 @@ function App() {
   const exportAccountBalancesPDF = (percentile) => {
     if (!results || !results.percentileDetails || !results.percentileDetails[percentile]) return;
     const data = results.percentileDetails[percentile];
-    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : '90th';
+    const percentileLabel = percentile === 'p10' ? '10th' : percentile === 'p25' ? '25th' : percentile === 'p50' ? '50th' : percentile === 'p75' ? '75th' : percentile === 'p90' ? '90th' : '99th';
     
     let html = '<!DOCTYPE html><html><head><title>Account Balances - ' + percentileLabel + ' Percentile</title>';
     html += '<style>';
@@ -2026,6 +2146,19 @@ function App() {
               <div><label className="block text-sm text-slate-400 mb-2">Client 1 Name</label><input type="text" value={client1Name} onChange={e => setClient1Name(e.target.value)} placeholder="Enter name" /></div>
               <div><label className="block text-sm text-slate-400 mb-2">Client 1 Age</label><input type="text" value={client1Age} onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setClient1Age(v === '' ? '' : parseInt(v)); }} onBlur={e => { if (e.target.value === '') setClient1Age(60); }} /></div>
               <div><label className="block text-sm text-slate-400 mb-2">Client 1 Plan Length (years)</label><input type="text" value={client1PlanLength} onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setClient1PlanLength(v === '' ? '' : parseInt(v)); }} onBlur={e => { if (e.target.value === '') setClient1PlanLength(30); }} /></div>
+              <div>
+                <label className="block text-sm text-slate-400 mb-2">Client 1 RMD Start Age</label>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" name="client1RmdAge" checked={client1RmdAge === 73} onChange={() => setClient1RmdAge(73)} className="accent-amber-500" />
+                    <span className="text-sm">73 (born 1951-1959)</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" name="client1RmdAge" checked={client1RmdAge === 75} onChange={() => setClient1RmdAge(75)} className="accent-amber-500" />
+                    <span className="text-sm">75 (born 1960+)</span>
+                  </label>
+                </div>
+              </div>
               <div><label className="block text-sm text-slate-400 mb-2">Current Year</label><input type="text" value={currentYear} onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setCurrentYear(v === '' ? '' : parseInt(v)); }} onBlur={e => { if (e.target.value === '') setCurrentYear(2026); }} /></div>
               <div>
                 <label className="block text-sm text-slate-400 mb-2">Filing Status</label>
@@ -2049,6 +2182,19 @@ function App() {
                   <div><label className="block text-sm text-slate-400 mb-2">Client 2 Name</label><input type="text" value={client2Name} onChange={e => setClient2Name(e.target.value)} placeholder="Enter name" /></div>
                   <div><label className="block text-sm text-slate-400 mb-2">Client 2 Age</label><input type="text" value={client2Age} onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setClient2Age(v === '' ? '' : parseInt(v)); }} onBlur={e => { if (e.target.value === '') setClient2Age(58); }} /></div>
                   <div><label className="block text-sm text-slate-400 mb-2">Client 2 Plan Length (years)</label><input type="text" value={client2PlanLength} onChange={e => { const v = e.target.value; if (v === '' || /^\d+$/.test(v)) setClient2PlanLength(v === '' ? '' : parseInt(v)); }} onBlur={e => { if (e.target.value === '') setClient2PlanLength(32); }} /></div>
+                  <div>
+                    <label className="block text-sm text-slate-400 mb-2">Client 2 RMD Start Age</label>
+                    <div className="flex gap-4">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="radio" name="client2RmdAge" checked={client2RmdAge === 73} onChange={() => setClient2RmdAge(73)} className="accent-amber-500" />
+                        <span className="text-sm">73 (born 1951-1959)</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="radio" name="client2RmdAge" checked={client2RmdAge === 75} onChange={() => setClient2RmdAge(75)} className="accent-amber-500" />
+                        <span className="text-sm">75 (born 1960+)</span>
+                      </label>
+                    </div>
+                  </div>
                 </div>
               )}
               {filingStatus === 'mfj' && (
@@ -2101,7 +2247,7 @@ function App() {
               {!allocationsValid && <span className="text-xs text-red-400">{allocationSum > 100 ? 'Exceeds 100%' : `${100 - allocationSum}% remaining`}</span>}
             </div>
             <div className="bg-slate-800/50 rounded-lg px-4 py-2 text-xs text-slate-500 space-y-1">
-              <div className="flex justify-between gap-6"><span>Portfolio Arithmetic Return:</span><span className={`font-semibold ${allocationsValid ? 'text-green-300' : 'text-slate-500'}`}>{allocationsValid ? expectedReturn.toFixed(2) + '%' : '-'}</span></div>
+              <div className="flex justify-between gap-6"><span>Portfolio Geometric Return:</span><span className={`font-semibold ${allocationsValid ? 'text-green-300' : 'text-slate-500'}`}>{allocationsValid ? expectedReturn.toFixed(2) + '%' : '-'}</span></div>
               <div className="flex justify-between gap-6"><span>Portfolio Std Deviation:</span><span className={`font-semibold ${allocationsValid ? 'text-green-300' : 'text-slate-500'}`}>{allocationsValid ? stdDev.toFixed(2) + '%' : '-'}</span></div>
             </div>
           </div>
@@ -2373,7 +2519,7 @@ function App() {
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="text-center bg-slate-800/50 rounded-xl p-4">
-                  <div className="text-sm text-slate-400 mb-1">Arithmetic Return</div>
+                  <div className="text-sm text-slate-400 mb-1">Geometric Return</div>
                   <div className="text-xl font-semibold text-green-300">{expectedReturn.toFixed(2)}%</div>
                 </div>
                 <div className="text-center bg-slate-800/50 rounded-xl p-4">
@@ -2385,8 +2531,8 @@ function App() {
 
             <div className="card card-accent p-6">
               <h3 className="font-display text-xl font-semibold mb-5 text-amber-200">Ending Portfolio Percentiles</h3>
-              <div className="grid grid-cols-5 gap-4">
-                {[{l:'10th',v:results.percentileEnding.p10,c:'text-red-300'},{l:'25th',v:results.percentileEnding.p25,c:'text-orange-300'},{l:'50th',v:results.percentileEnding.p50,c:'text-amber-300'},{l:'75th',v:results.percentileEnding.p75,c:'text-green-300'},{l:'90th',v:results.percentileEnding.p90,c:'text-emerald-300'}].map(p=>(
+              <div className="grid grid-cols-6 gap-4">
+                {[{l:'10th',v:results.percentileEnding.p10,c:'text-red-300'},{l:'25th',v:results.percentileEnding.p25,c:'text-orange-300'},{l:'50th',v:results.percentileEnding.p50,c:'text-amber-300'},{l:'75th',v:results.percentileEnding.p75,c:'text-green-300'},{l:'90th',v:results.percentileEnding.p90,c:'text-emerald-300'},{l:'99th',v:results.percentileEnding.p99,c:'text-cyan-300'}].map(p=>(
                   <div key={p.l} className="text-center bg-slate-800/50 rounded-xl p-4">
                     <div className="text-sm text-slate-400 mb-1">{p.l}</div>
                     <div className={`text-xl font-semibold ${p.c}`}>{formatCurrency(p.v)}</div>
@@ -2410,6 +2556,7 @@ function App() {
                   <Recharts.Line type="monotone" dataKey="p50" name="50th (Median)" stroke="#22c55e" strokeWidth={3} dot={false} />
                   <Recharts.Line type="monotone" dataKey="p75" name="75th" stroke="#3b82f6" strokeWidth={2} dot={false} />
                   <Recharts.Line type="monotone" dataKey="p90" name="90th" stroke="#8b5cf6" strokeWidth={2} dot={false} />
+                  <Recharts.Line type="monotone" dataKey="p99" name="99th" stroke="#06b6d4" strokeWidth={2} dot={false} />
                 </Recharts.LineChart>
               </Recharts.ResponsiveContainer>
             </div>
@@ -2431,7 +2578,7 @@ function App() {
                   </p>
                   
                   <div className="flex gap-2 mb-4">
-                    {[{key:'p10',label:'10th'},{key:'p25',label:'25th'},{key:'p50',label:'50th'},{key:'p75',label:'75th'},{key:'p90',label:'90th'}].map(p => (
+                    {[{key:'p10',label:'10th'},{key:'p25',label:'25th'},{key:'p50',label:'50th'},{key:'p75',label:'75th'},{key:'p90',label:'90th'},{key:'p99',label:'99th'}].map(p => (
                       <button 
                         key={p.key}
                         onClick={() => setVerificationPercentile(p.key)}
@@ -2521,7 +2668,7 @@ function App() {
                   </div>
                   
                   <p className="text-xs text-slate-500 mt-3">
-                    Note: This is actual simulation data with random returns. The {verificationPercentile === 'p50' ? '50th' : verificationPercentile === 'p10' ? '10th' : verificationPercentile === 'p25' ? '25th' : verificationPercentile === 'p75' ? '75th' : '90th'} percentile simulation ended with {formatCurrency(results.percentileEnding[verificationPercentile])}.
+                    Note: This is actual simulation data with random returns. The {verificationPercentile === 'p50' ? '50th' : verificationPercentile === 'p10' ? '10th' : verificationPercentile === 'p25' ? '25th' : verificationPercentile === 'p75' ? '75th' : verificationPercentile === 'p90' ? '90th' : '99th'} percentile simulation ended with {formatCurrency(results.percentileEnding[verificationPercentile])}.
                   </p>
                 </div>
               )}
@@ -2545,7 +2692,7 @@ function App() {
                   <div className="flex items-center gap-4 mb-4">
                     <span className="text-sm text-slate-400">Percentile:</span>
                     <div className="flex gap-2">
-                      {[{key:'p10',label:'10th'},{key:'p25',label:'25th'},{key:'p50',label:'50th'},{key:'p75',label:'75th'},{key:'p90',label:'90th'}].map(p => (
+                      {[{key:'p10',label:'10th'},{key:'p25',label:'25th'},{key:'p50',label:'50th'},{key:'p75',label:'75th'},{key:'p90',label:'90th'},{key:'p99',label:'99th'}].map(p => (
                         <button 
                           key={p.key}
                           onClick={() => setVerificationPercentile(p.key)}
@@ -2663,6 +2810,9 @@ function App() {
                           <div className="space-y-2 text-sm">
                             <div className="flex justify-between"><span className="text-slate-400">Tax on Ordinary Income:</span><span className="text-red-300">{formatCurrency(td.federalOrdinaryTax)}</span></div>
                             <div className="flex justify-between"><span className="text-slate-400">Tax on Capital Gains:</span><span className="text-red-300">{formatCurrency(td.federalCapGainsTax)}</span></div>
+                            {(td.niitTax || 0) > 0 && (
+                              <div className="flex justify-between"><span className="text-slate-400">Net Investment Income Tax (3.8%):</span><span className="text-red-300">{formatCurrency(td.niitTax)}</span></div>
+                            )}
                             <div className="flex justify-between border-t border-slate-600 pt-2 mt-2"><span className="text-slate-300 font-medium">Total Federal Tax:</span><span className="text-red-400 font-medium">{formatCurrency(yearData.federalTax)}</span></div>
                           </div>
                         </div>
@@ -2876,12 +3026,13 @@ function App() {
                 <div className="mt-5">
                   <p className="text-sm text-slate-400 mb-4">
                     Track how each account type (Pre-Tax, Roth, Taxable) changes over time. Select a percentile to see the account breakdown for that simulation outcome.
+                    <br/><em>Note: These percentiles are based on ending portfolio value (affected by withdrawals and sequence of returns).</em>
                   </p>
                   
                   <div className="flex items-center gap-4 mb-4">
                     <span className="text-sm text-slate-400">Percentile:</span>
                     <div className="flex gap-2">
-                      {[{key:'p10',label:'10th'},{key:'p25',label:'25th'},{key:'p50',label:'50th'},{key:'p75',label:'75th'},{key:'p90',label:'90th'}].map(p => (
+                      {[{key:'p10',label:'10th'},{key:'p25',label:'25th'},{key:'p50',label:'50th'},{key:'p75',label:'75th'},{key:'p90',label:'90th'},{key:'p99',label:'99th'}].map(p => (
                         <button 
                           key={p.key}
                           onClick={() => setAccountBalancesPercentile(p.key)}
@@ -3010,9 +3161,112 @@ function App() {
                         
                         <div className="bg-slate-800/50 rounded-lg p-3 mt-4">
                           <p className="text-xs text-slate-500">
-                            <strong>Withdrawal Order:</strong> The bracket-filling strategy prioritizes: 1) RMDs (required), 2) Fill 12% bracket with Pre-Tax, 
+                            <strong>Withdrawal Order:</strong> The bracket-filling strategy prioritizes: 1) RMDs (required), 2) Fill 12% bracket with Pre-Tax,
                             3) Taxable (capital gains may be 0%), 4) Additional Pre-Tax if needed, 5) Roth last (preserves tax-free growth).
                             This explains why Pre-Tax typically depletes faster than Roth.
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
+
+            {/* Return Distribution Section */}
+            <div className="card card-accent p-6">
+              <button
+                onClick={() => setReturnDistributionOpen(!returnDistributionOpen)}
+                className="w-full flex justify-between items-center text-left"
+              >
+                <h3 className="font-display text-xl font-semibold text-amber-200">📈 Return Distribution (Pure Market Returns)</h3>
+                <span className="text-amber-200 text-2xl">{returnDistributionOpen ? '−' : '+'}</span>
+              </button>
+
+              {returnDistributionOpen && results.returnPercentileDetails && (
+                <div className="mt-5">
+                  <p className="text-sm text-slate-400 mb-4">
+                    These percentiles are based on compound annual growth rate (CAGR) of pure market returns, independent of withdrawals or sequence of returns.
+                    Use this to validate that simulated returns match expected distributions.
+                  </p>
+
+                  {/* Summary of all percentiles */}
+                  <div className="grid grid-cols-7 gap-2 mb-6">
+                    {[{key:'p1',label:'1st'},{key:'p10',label:'10th'},{key:'p25',label:'25th'},{key:'p50',label:'50th'},{key:'p75',label:'75th'},{key:'p90',label:'90th'},{key:'p99',label:'99th'}].map(p => (
+                      <div key={p.key} className={`bg-slate-800/70 rounded-lg p-3 text-center cursor-pointer transition-all ${returnDistributionPercentile === p.key ? 'ring-2 ring-amber-500' : 'hover:bg-slate-700/70'}`} onClick={() => setReturnDistributionPercentile(p.key)}>
+                        <div className="text-xs text-slate-400 mb-1">{p.label}</div>
+                        <div className={`text-lg font-semibold ${results.returnPercentiles[p.key] >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {(results.returnPercentiles[p.key] * 100).toFixed(2)}%
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Detailed view for selected percentile */}
+                  {(() => {
+                    const detail = results.returnPercentileDetails[returnDistributionPercentile];
+                    if (!detail) return null;
+
+                    const percentileLabel = returnDistributionPercentile === 'p1' ? '1st' : returnDistributionPercentile === 'p10' ? '10th' : returnDistributionPercentile === 'p25' ? '25th' : returnDistributionPercentile === 'p50' ? '50th' : returnDistributionPercentile === 'p75' ? '75th' : returnDistributionPercentile === 'p90' ? '90th' : '99th';
+
+                    return (
+                      <div>
+                        <h4 className="text-lg font-semibold text-amber-200 mb-3">{percentileLabel} Percentile Simulation Details</h4>
+
+                        {/* Statistics */}
+                        <div className="grid grid-cols-3 gap-4 mb-4">
+                          <div className="bg-slate-800/70 rounded-lg p-3 text-center">
+                            <div className="text-xs text-slate-400 mb-1">CAGR</div>
+                            <div className={`text-xl font-semibold ${detail.cagr >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {(detail.cagr * 100).toFixed(2)}%
+                            </div>
+                          </div>
+                          <div className="bg-slate-800/70 rounded-lg p-3 text-center">
+                            <div className="text-xs text-slate-400 mb-1">Arithmetic Mean</div>
+                            <div className={`text-xl font-semibold ${detail.arithmeticMean >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {(detail.arithmeticMean * 100).toFixed(2)}%
+                            </div>
+                          </div>
+                          <div className="bg-slate-800/70 rounded-lg p-3 text-center">
+                            <div className="text-xs text-slate-400 mb-1">Std Deviation</div>
+                            <div className="text-xl font-semibold text-blue-400">
+                              {(detail.stdDev * 100).toFixed(2)}%
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Year-by-year table */}
+                        <div className="overflow-x-auto" style={{maxHeight:'400px',overflowY:'auto'}}>
+                          <table className="data-table text-xs">
+                            <thead style={{position:'sticky',top:0}}>
+                              <tr>
+                                <th>Year</th>
+                                <th>Calendar Year</th>
+                                <th>Annual Return</th>
+                                <th>CAGR to Date</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {detail.yearByYear.map((d, idx) => (
+                                <tr key={idx}>
+                                  <td>{d.year + 1}</td>
+                                  <td>{d.calYear}</td>
+                                  <td className={d.annualReturn >= 0 ? 'text-green-400' : 'text-red-400'}>
+                                    {(d.annualReturn * 100).toFixed(2)}%
+                                  </td>
+                                  <td className={d.cagrToDate >= 0 ? 'text-green-400' : 'text-red-400'}>
+                                    {(d.cagrToDate * 100).toFixed(2)}%
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        <div className="bg-slate-800/50 rounded-lg p-3 mt-4">
+                          <p className="text-xs text-slate-500">
+                            <strong>Note:</strong> These are pure market returns from the simulation, calculated as CAGR = [(1+r₁)(1+r₂)...(1+rₙ)]^(1/n) - 1.
+                            The percentiles are sorted by CAGR, not by ending portfolio value. This allows you to verify that return distributions match your expected geometric means and volatilities.
                           </p>
                         </div>
                       </div>
